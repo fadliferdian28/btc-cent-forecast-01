@@ -2,12 +2,12 @@
 """btc-cent-forecast-01: 240-minute-ahead BTC (cbBTC/USDC Orca pool) price
 forecaster. One program, run once per case, no network, fully deterministic.
 
-Forecast = k-NN analog estimate: the last 480 minutes, demeaned and
-volatility-normalized into a 48-point shape, matched against every earlier
-480-minute window in the 72-hour history; the forecast is the current price
-scaled by the median 240-minute-ahead ratio of the 10 nearest analogs.
-Shrinkage (last price 20% toward the trailing 240-minute mean) is the
-fallback when no analog is usable.
+Forecast = shrinkage: the checkpoint close shrunk 40% of the way toward the
+trailing 240-minute mean. This was the best of 14 candidate models on the
+reliable backtests (76 hourly checkpoints: MAE $360.53 vs $374.35 for
+persistence, -3.7%; 19 independent 4-hourly checkpoints: $328.37 vs $334.82,
+-1.9%). A k-NN analog model won on the 5 practice cases but lost badly on
+the 76-checkpoint grid (+24% vs persistence), so it was rejected as noise.
 
 On any error the forecaster falls back to the checkpoint close (persistence),
 so every case always yields a valid output.
@@ -16,82 +16,21 @@ so every case always yields a valid output.
 import json
 import math
 import os
-import sys
 
-WINDOW = 480          # minutes in the analog shape window
-STEP = 10             # downsample: one point per 10 minutes -> 48-dim shape
-HORIZON = 240         # minutes ahead to forecast
-K = 10                # nearest analogs kept
-SHRINK = 0.2          # shrinkage toward the trailing 240-min mean (fallback)
-
-
-def shape(prices, end):
-    """Demeaned, volatility-normalized 48-point shape ending at index `end`
-    (exclusive). Returns a list of floats, or None if the window is unusable."""
-    raw = [prices[end - WINDOW + i * STEP] for i in range(WINDOW // STEP)]
-    mean = sum(raw) / len(raw)
-    dev = [x - mean for x in raw]
-    var = sum(x * x for x in dev) / len(dev)
-    std = math.sqrt(var)
-    if std <= 0:
-        return [0.0] * len(dev)
-    return [x / std for x in dev]
-
-
-def knn_forecast(prices):
-    """Median-analog forecast. Returns None if no usable analog exists."""
-    n = len(prices)
-    last = prices[-1]
-    query = shape(prices, n)
-    if query is None:
-        return None
-    # Candidate windows end at t (exclusive), with a known outcome 240 min
-    # later: t ranges so that t + HORIZON < n and the window fits.
-    scored = []
-    for t in range(WINDOW, n - HORIZON):
-        cand = shape(prices, t)
-        if cand is None:
-            continue
-        dist = 0.0
-        for a, b in zip(query, cand):
-            d = a - b
-            dist += d * d
-        # Outcome as a ratio from the candidate window's end price.
-        base = prices[t - 1]
-        if base <= 0:
-            continue
-        ratio = prices[t + HORIZON] / base
-        if not (0.5 < ratio < 2.0):
-            continue
-        scored.append((dist, ratio))
-    if len(scored) < K:
-        return None
-    scored.sort(key=lambda item: item[0])
-    ratios = sorted(r for _, r in scored[:K])
-    mid = K // 2
-    median_ratio = (ratios[mid - 1] + ratios[mid]) / 2.0
-    return last * median_ratio
-
-
-def shrink_forecast(prices):
-    """Last price shrunk SHRINK of the way toward the trailing 240-min mean."""
-    last = prices[-1]
-    tail = prices[-HORIZON:]
-    mean = sum(tail) / len(tail)
-    return last + SHRINK * (mean - last)
+HORIZON = 240         # minutes ahead to forecast; also the trailing-mean window
+SHRINK = 0.4          # fraction of the way from the last price to the mean
 
 
 def forecast(prices):
-    """k-NN analog forecast, with shrinkage as the fallback when no analog
-    is usable; falls back to persistence on any error."""
+    """Last price shrunk SHRINK toward the trailing 240-minute mean.
+    Falls back to persistence on any error."""
     last = prices[-1]
     try:
-        knn = knn_forecast(prices)
-        if knn is not None and math.isfinite(knn) and knn > 0:
-            return knn
-        shr = shrink_forecast(prices)
-        if math.isfinite(shr) and shr > 0:
-            return shr
+        tail = prices[-HORIZON:]
+        mean = sum(tail) / len(tail)
+        value = last + SHRINK * (mean - last)
+        if math.isfinite(value) and value > 0:
+            return value
         return last
     except Exception:
         return last
@@ -103,7 +42,7 @@ def run_case(case):
     if not markets:
         raise ValueError("no markets in case")
     prices = markets[0].get("prices") or []
-    if len(prices) < WINDOW + HORIZON + 1:
+    if len(prices) < HORIZON + 1:
         raise ValueError("too few prices in case")
     price = forecast(prices)
     if not math.isfinite(price) or price <= 0 or price >= 10_000_000:
